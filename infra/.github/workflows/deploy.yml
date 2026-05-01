@@ -1,0 +1,217 @@
+name: CI-CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPO: ${{ secrets.ECR_REPO }}
+
+jobs:
+
+# ---------------------------
+# 1. LINT + VALIDATE
+# ---------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: infra/enviornments/staging
+
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: infra/enviornments/staging
+
+# ---------------------------
+# 2. TEST
+# ---------------------------
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run application tests
+        run: |
+          echo "Add your test command here e.g. npm test / pytest / go test"
+
+# ---------------------------
+# 3. BUILD & PUSH IMAGE
+# ---------------------------
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION \
+          | docker login --username AWS --password-stdin $ECR_REPO
+
+      - name: Build & Tag Image
+        id: build-image
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          IMAGE=$ECR_REPO:$IMAGE_TAG
+          docker build -t $IMAGE .
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Push Image
+        run: docker push ${{ steps.build-image.outputs.image }}
+
+# ---------------------------
+# 4. DEPLOY TO STAGING
+# ---------------------------
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          region: ${{ env.AWS_REGION }}
+
+      - name: Get current task definition
+        id: current-task
+        run: |
+          TASK_DEF=$(aws ecs describe-services \
+            --cluster ${{ secrets.ECS_CLUSTER_STAGING }} \
+            --services ${{ secrets.ECS_SERVICE_STAGING }} \
+            --query "services[0].taskDefinition" \
+            --output text)
+          echo "task_def=$TASK_DEF" >> $GITHUB_OUTPUT
+
+      - name: Register new task definition
+        id: new-task
+        run: |
+          NEW_IMAGE=${{ needs.build.outputs.image }}
+
+          aws ecs describe-task-definition \
+            --task-definition ${{ steps.current-task.outputs.task_def }} \
+            --query "taskDefinition" > task.json
+
+          cat task.json | jq \
+            --arg IMAGE "$NEW_IMAGE" \
+            '.containerDefinitions[0].image = $IMAGE
+             | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
+            > new-task.json
+
+          NEW_TASK_DEF=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task.json \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+
+          echo "new_task_def=$NEW_TASK_DEF" >> $GITHUB_OUTPUT
+
+      - name: Deploy to ECS (staging)
+        run: |
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER_STAGING }} \
+            --service ${{ secrets.ECS_SERVICE_STAGING }} \
+            --task-definition ${{ steps.new-task.outputs.new_task_def }}
+
+# ---------------------------
+# 5. HEALTH CHECK (Rollback Logic)
+# ---------------------------
+      - name: Wait & Validate Health
+        run: |
+          echo "Waiting for service to stabilize (up to 5 minutes)..."
+          sleep 300
+
+          STATUS=$(aws ecs describe-services \
+            --cluster ${{ secrets.ECS_CLUSTER_STAGING }} \
+            --services ${{ secrets.ECS_SERVICE_STAGING }} \
+            --query "services[0].deployments[?status=='PRIMARY'].rolloutState" \
+            --output text)
+
+          if [ "$STATUS" != "COMPLETED" ]; then
+            echo "Deployment failed — rolling back to ${{ steps.current-task.outputs.task_def }}"
+
+            aws ecs update-service \
+              --cluster ${{ secrets.ECS_CLUSTER_STAGING }} \
+              --service ${{ secrets.ECS_SERVICE_STAGING }} \
+              --task-definition ${{ steps.current-task.outputs.task_def }}
+
+            exit 1
+          fi
+
+# ---------------------------
+# 6. DEPLOY TO PRODUCTION
+# ---------------------------
+  deploy-prod:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          region: ${{ env.AWS_REGION }}
+
+      - name: Get current prod task definition
+        id: current-prod-task
+        run: |
+          TASK_DEF=$(aws ecs describe-services \
+            --cluster ${{ secrets.ECS_CLUSTER_PROD }} \
+            --services ${{ secrets.ECS_SERVICE_PROD }} \
+            --query "services[0].taskDefinition" \
+            --output text)
+          echo "task_def=$TASK_DEF" >> $GITHUB_OUTPUT
+
+      - name: Register new task definition for prod
+        id: new-prod-task
+        run: |
+          NEW_IMAGE=${{ needs.build.outputs.image }}
+
+          aws ecs describe-task-definition \
+            --task-definition ${{ steps.current-prod-task.outputs.task_def }} \
+            --query "taskDefinition" > task.json
+
+          cat task.json | jq \
+            --arg IMAGE "$NEW_IMAGE" \
+            '.containerDefinitions[0].image = $IMAGE
+             | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
+            > new-task.json
+
+          NEW_TASK_DEF=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task.json \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+
+          echo "new_task_def=$NEW_TASK_DEF" >> $GITHUB_OUTPUT
+
+      - name: Deploy to ECS (production)
+        run: |
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER_PROD }} \
+            --service ${{ secrets.ECS_SERVICE_PROD }} \
+            --task-definition ${{ steps.new-prod-task.outputs.new_task_def }}
